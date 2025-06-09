@@ -207,9 +207,9 @@
         throw new Error('Server status is not OK');
       }
 
-      const websocketUrl = serverInfo.websocket_url + '/stream/' + serverInfo.conversation_id;
-
-      return websocketUrl;
+      const streamPath = '/stream/' + serverInfo.conversation_id;
+      const websocketUrl = new URL(streamPath, serverInfo.websocket_url);
+      return websocketUrl.toString();
     }
 
     function setupMediaSource() {
