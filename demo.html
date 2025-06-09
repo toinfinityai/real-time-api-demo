@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Lemon Slice Real-Time API Demo</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    .container {
+      text-align: center;
+    }
+
+    video {
+      border: 2px solid #333;
+      border-radius: 8px;
+      margin: 20px 0;
+    }
+
+    .controls {
+      margin: 20px 0;
+    }
+
+    button {
+      background: #007bff;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 5px;
+      cursor: pointer;
+      margin: 0 10px;
+      font-size: 16px;
+    }
+
+    button:hover {
+      background: #0056b3;
+    }
+
+    button:disabled {
+      background: #6c757d;
+      cursor: not-allowed;
+    }
+
+    .status {
+      margin: 10px 0;
+      padding: 10px;
+      border-radius: 5px;
+      font-weight: bold;
+    }
+
+    .status.connecting {
+      background: #fff3cd;
+      color: #856404;
+    }
+
+    .status.connected {
+      background: #d4edda;
+      color: #155724;
+    }
+
+    .status.error {
+      background: #f8d7da;
+      color: #721c24;
+    }
+
+    .config {
+      background: #f8f9fa;
+      padding: 15px;
+      border-radius: 5px;
+      margin: 20px 0;
+      text-align: left;
+    }
+
+    .config input, .config textarea {
+      width: 100%;
+      padding: 8px;
+      margin: 5px 0;
+      border: 1px solid #ddd;
+      border-radius: 3px;
+    }
+
+    .config label {
+      display: block;
+      margin-top: 10px;
+      font-weight: bold;
+    }
+
+    #audioFile {
+      margin: 10px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Lemon Slice Real-Time API Demo</h1>
+
+    <div class="config">
+      <h3>Configuration</h3>
+      <label for="imageUrlInput">Image URL:</label>
+      <input type="url" id="imageUrlInput">
+      <small style="display: block; color: #666; margin-top: 5px;">
+        💡 Characters are cached per image URL. Change the URL to create a new character.
+      </small>
+
+      <label for="audioFile">Audio File (RAW 16kHz):</label>
+      <input type="file" id="audioFile" accept=".raw,.pcm">
+    </div>
+
+    <div class="controls">
+      <button id="connectBtn" onclick="initializeConnection()">Connect & Start Stream</button>
+      <button id="stopBtn" onclick="stopStream()" disabled>Stop Stream</button>
+    </div>
+
+    <div id="status" class="status">Ready to connect</div>
+
+    <video id="video" controls width="640" height="480">
+      Your browser doesn't support video playback.
+    </video>
+  </div>
+
+  <script>
+    const API_BASE_URL = "https://www.lemonslice.com/api/stream";
+    const FRAME_RATE = 25;
+    const DEFAULT_IMAGE_URL = "https://6ammc3n5zzf5ljnz.public.blob.vercel-storage.com/inf2-image-uploads/image_63e52-eRRSrv7K7CQ4Bgp8ojTbpiR6ZBoqfT.jpg"
+
+    let websocket = null;
+    let mediaSource = null;
+    let sourceBuffer = null;
+    let characterCache = {};
+    let audioData = null;
+    let isStreaming = false;
+
+    function updateStatus(message, type = '') {
+      const statusEl = document.getElementById('status');
+      statusEl.textContent = message;
+      statusEl.className = `status ${type}`;
+    }
+
+    function generateUUID() {
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    }
+
+    async function makeRequest(url, options = {}) {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          ...options.headers
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      return response.json();
+    }
+
+    async function createCharacter() {
+      const imageUrl = document.getElementById('imageUrlInput').value;
+      return await makeRequest(`${API_BASE_URL}/create-character`, {
+        method: 'POST',
+        body: JSON.stringify({ image_url: imageUrl })
+      });
+    }
+
+    async function createSession(character) {
+      const imageUrl = document.getElementById('imageUrlInput').value;
+      return await makeRequest(`${API_BASE_URL}/new-session`, {
+        method: 'POST',
+        body: JSON.stringify({
+          image_url: imageUrl,
+          output_format: 'video_chunks',
+          ...character
+        })
+      });
+    }
+
+    async function setupWebSocketUrl() {
+      const imageUrl = document.getElementById('imageUrlInput').value;
+
+      updateStatus('Creating character...', 'connecting');
+
+      // Only create new character if image URL changed or doesn't exist
+      if (!characterCache[imageUrl]) {
+        console.log('Creating new character for image:', imageUrl);
+        characterCache[imageUrl] = await createCharacter();
+      } else {
+        console.log('Using cached character for image:', imageUrl);
+      }
+
+      updateStatus('Creating session...', 'connecting');
+      const serverInfo = await createSession(characterCache[imageUrl]);
+
+      // Check server status
+      const pingResponse = await fetch(serverInfo.server_url + '/status');
+      const pingData = await pingResponse.json();
+
+      if (pingData.status !== 'OK') {
+        throw new Error('Server status is not OK');
+      }
+
+      const websocketUrl = serverInfo.websocket_url + '/stream/' + serverInfo.conversation_id;
+
+      return websocketUrl;
+    }
+
+    function setupMediaSource() {
+      const video = document.getElementById('video');
+      mediaSource = new MediaSource();
+      video.src = URL.createObjectURL(mediaSource);
+
+      return new Promise((resolve, reject) => {
+        mediaSource.addEventListener('sourceopen', () => {
+          const mime = 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"';
+          if (!MediaSource.isTypeSupported(mime)) {
+            reject(new Error('Codec not supported: ' + mime));
+            return;
+          }
+
+          sourceBuffer = mediaSource.addSourceBuffer(mime);
+          sourceBuffer.mode = 'sequence';
+          resolve();
+        });
+
+        mediaSource.addEventListener('error', reject);
+      });
+    }
+
+    function appendVideoChunk(chunkData) {
+      if (sourceBuffer && !sourceBuffer.updating) {
+        try {
+          sourceBuffer.appendBuffer(chunkData);
+        } catch (error) {
+          console.error('Failed to append video chunk:', error);
+        }
+      }
+    }
+
+    function base64ToArrayBuffer(base64) {
+      const binaryString = atob(base64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      return bytes.buffer;
+    }
+
+    async function sendAudioData(ws, responseId) {
+      if (!audioData) {
+        updateStatus('No audio data loaded', 'error');
+        return;
+      }
+
+      // Send initialization
+      ws.send(JSON.stringify({
+        type: 'initialize_response',
+        response_id: responseId
+      }));
+
+      // Send audio in chunks
+      const chunkSize = 3200; // 100ms at 16kHz
+      for (let i = 0; i < audioData.length; i += chunkSize) {
+        const chunk = audioData.slice(i, i + chunkSize);
+        const chunkB64 = btoa(String.fromCharCode(...chunk));
+
+        ws.send(JSON.stringify({
+          type: 'audio_buffer_append',
+          audio: chunkB64,
+          response_id: responseId
+        }));
+
+        // Simulate real-time pacing
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      // Commit the response
+      ws.send(JSON.stringify({
+        type: 'commit',
+        response_id: responseId
+      }));
+    }
+
+    function handleWebSocketMessage(data) {
+      if (data.type === 'video_chunk') {
+        console.log('Received video chunk');
+        const videoChunk = base64ToArrayBuffer(data.video_chunk);
+        appendVideoChunk(videoChunk);
+      } else if (data.type === 'batch_frames') {
+        console.log('Received batch frames (not implemented for streaming)');
+        // Could implement frame-by-frame processing here if needed
+      } else if (data.type === 'LS_video_end') {
+        console.log('Video stream completed');
+        updateStatus('Stream completed', 'connected');
+
+        // End the media source stream
+        if (mediaSource && mediaSource.readyState === 'open') {
+          try {
+            mediaSource.endOfStream();
+          } catch (error) {
+            console.error('Error ending stream:', error);
+          }
+        }
+
+        isStreaming = false;
+        document.getElementById('connectBtn').disabled = false;
+        document.getElementById('stopBtn').disabled = true;
+      }
+    }
+
+    async function initializeConnection() {
+      try {
+        document.getElementById('connectBtn').disabled = true;
+        document.getElementById('stopBtn').disabled = false;
+        isStreaming = true;
+
+        // Setup media source first
+        await setupMediaSource();
+        updateStatus('Media source ready, connecting to WebSocket...', 'connecting');
+
+        // Get WebSocket URL
+        const wsUrl = await setupWebSocketUrl();
+        updateStatus('Connecting to WebSocket...', 'connecting');
+
+        // Connect to WebSocket
+        websocket = new WebSocket(wsUrl);
+        const responseId = generateUUID();
+
+        websocket.onopen = () => {
+          updateStatus('Connected! Starting audio stream...', 'connected');
+          sendAudioData(websocket, responseId);
+        };
+
+        websocket.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            handleWebSocketMessage(data);
+          } catch (error) {
+            console.error('Failed to parse WebSocket message:', error);
+          }
+        };
+
+        websocket.onclose = () => {
+          updateStatus('WebSocket connection closed', '');
+          isStreaming = false;
+          document.getElementById('connectBtn').disabled = false;
+          document.getElementById('stopBtn').disabled = true;
+        };
+
+        websocket.onerror = (error) => {
+          updateStatus('WebSocket error occurred', 'error');
+          console.error('WebSocket error:', error);
+        };
+
+      } catch (error) {
+        updateStatus(`Error: ${error.message}`, 'error');
+        console.error('Connection error:', error);
+        document.getElementById('connectBtn').disabled = false;
+        document.getElementById('stopBtn').disabled = true;
+      }
+    }
+
+    function stopStream() {
+      if (websocket) {
+        websocket.close();
+      }
+
+      if (mediaSource && mediaSource.readyState === 'open') {
+        try {
+          mediaSource.endOfStream();
+        } catch (error) {
+          console.error('Error ending stream:', error);
+        }
+      }
+
+      isStreaming = false;
+      document.getElementById('connectBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
+      updateStatus('Stream stopped', '');
+    }
+
+    // Handle audio file upload
+    document.getElementById('audioFile').addEventListener('change', (event) => {
+      const file = event.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          audioData = new Uint8Array(e.target.result);
+          updateStatus(`Audio file loaded: ${file.name} (${audioData.length} bytes)`, 'connected');
+        };
+        reader.readAsArrayBuffer(file);
+      }
+    });
+
+    window.onload = function() {
+      document.getElementById("imageUrlInput").value = DEFAULT_IMAGE_URL;
+    };
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+      if (websocket) {
+        websocket.close();
+      }
+    });
+  </script>
+</body>
+</html>
