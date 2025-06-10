@@ -75,7 +75,7 @@
       text-align: left;
     }
 
-    .config input, .config textarea {
+    .config input, .config textarea, .config select {
       width: 100%;
       padding: 8px;
       margin: 5px 0;
@@ -91,6 +91,15 @@
 
     #audioFile {
       margin: 10px 0;
+    }
+
+    .audio-config > div {
+      flex: 1;
+    }
+
+    .audio-config select {
+      width: auto;
+      min-width: 100px;
     }
   </style>
 </head>
@@ -108,6 +117,14 @@
 
       <label for="audioFile">Audio File (RAW 16kHz):</label>
       <input type="file" id="audioFile" accept=".raw,.pcm">
+
+      <label for="playCount">Play Count (to test streaming):</label>
+      <select id="playCount">
+        <option value="1">1x (Original)</option>
+        <option value="2">2x (Double)</option>
+        <option value="5" selected>5x (Extended)</option>
+        <option value="10">10x (Long Test)</option>
+      </select>
     </div>
 
     <div class="controls">
@@ -259,26 +276,35 @@
         return;
       }
 
+      const playCount = parseInt(document.getElementById('playCount').value);
+
       // Send initialization
       ws.send(JSON.stringify({
         type: 'initialize_response',
         response_id: responseId
       }));
 
-      // Send audio in chunks
+      updateStatus(`Streaming audio ${playCount}x...`, 'connecting');
+
+      // Send audio in chunks, repeated based on playCount
       const chunkSize = 3200; // 100ms at 16kHz
-      for (let i = 0; i < audioData.length; i += chunkSize) {
-        const chunk = audioData.slice(i, i + chunkSize);
-        const chunkB64 = btoa(String.fromCharCode(...chunk));
 
-        ws.send(JSON.stringify({
-          type: 'audio_buffer_append',
-          audio: chunkB64,
-          response_id: responseId
-        }));
+      for (let playIteration = 0; playIteration < playCount; playIteration++) {
+        console.log(`Starting play iteration ${playIteration + 1} of ${playCount}`);
 
-        // Simulate real-time pacing
-        await new Promise(resolve => setTimeout(resolve, 100));
+        for (let i = 0; i < audioData.length; i += chunkSize) {
+          const chunk = audioData.slice(i, i + chunkSize);
+          const chunkB64 = btoa(String.fromCharCode(...chunk));
+
+          ws.send(JSON.stringify({
+            type: 'audio_buffer_append',
+            audio: chunkB64,
+            response_id: responseId
+          }));
+
+          // Simulate real-time pacing
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
       }
 
       // Commit the response
@@ -286,6 +312,8 @@
         type: 'commit',
         response_id: responseId
       }));
+
+      updateStatus('Audio streaming completed, generating video...', 'connecting');
     }
 
     function handleWebSocketMessage(data) {
@@ -293,9 +321,6 @@
         console.log('Received video chunk');
         const videoChunk = base64ToArrayBuffer(data.video_chunk);
         appendVideoChunk(videoChunk);
-      } else if (data.type === 'batch_frames') {
-        console.log('Received batch frames (not implemented for streaming)');
-        // Could implement frame-by-frame processing here if needed
       } else if (data.type === 'LS_video_end') {
         console.log('Video stream completed');
         updateStatus('Stream completed', 'connected');
@@ -393,9 +418,21 @@
         const reader = new FileReader();
         reader.onload = (e) => {
           audioData = new Uint8Array(e.target.result);
-          updateStatus(`Audio file loaded: ${file.name} (${audioData.length} bytes)`, 'connected');
+          const playCount = parseInt(document.getElementById('playCount').value);
+          const totalDuration = (audioData.length / 32000) * playCount; // Rough estimate at 16kHz * 2 bytes
+          updateStatus(`Audio file loaded: ${file.name} (${audioData.length} bytes, ~${totalDuration.toFixed(1)}s total @ ${playCount}x)`, 'connected');
         };
         reader.readAsArrayBuffer(file);
+      }
+    });
+
+    // Update duration estimate when play count changes
+    document.getElementById('playCount').addEventListener('change', () => {
+      if (audioData) {
+        const playCount = parseInt(document.getElementById('playCount').value);
+        const totalDuration = (audioData.length / 32000) * playCount; // Rough estimate
+        const fileName = document.getElementById('audioFile').files[0]?.name || 'audio file';
+        updateStatus(`Audio ready: ${fileName} (${audioData.length} bytes, ~${totalDuration.toFixed(1)}s total @ ${playCount}x)`, 'connected');
       }
     });
 
